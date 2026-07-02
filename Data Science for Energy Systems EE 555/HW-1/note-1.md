@@ -204,6 +204,75 @@ N points are only useful where they *are*. 1000 points all bunched at small `x` 
 
 ---
 
+## 8. The q-norm loss — making regression robust to outliers
+
+Everything so far used **squared error**. That choice was never questioned — but it's a choice, and it has a weakness: squaring makes big misses *very* expensive. One outlier with a residual of 40 contributes `40² = 1600` to the loss, while ten honest points with residuals of 1 contribute 10 total. The optimizer will happily sell out all ten to appease the one. That's exactly what happens in `task2.py`: the outlier drags the OLS line far above the true one.
+
+### The fix: change the exponent
+
+Squared error is just the **2-norm** of the residual vector. Generalize the exponent and you get the **q-norm loss**:
+
+```
+  L(w) = Σ | yᵢ − xᵢ·w |^q          with  1 ≤ q ≤ 2
+```
+
+| q     | Name                              | Behavior                                        |
+|-------|-----------------------------------|--------------------------------------------------|
+| 2     | Ordinary Least Squares            | smooth, closed-form, but outlier-sensitive       |
+| 1.1–1.5 | q-norm ("Lq regression")        | compromise: mostly smooth, mostly robust         |
+| 1     | Least Absolute Deviations (LAD)   | maximally robust, but not differentiable at 0    |
+
+**Why a smaller q resists outliers.** Look at how much one point's residual `r` contributes to the loss:
+
+```
+  q = 2:   |r|²      →  residual 40 costs 1600   (screams)
+  q = 1.1: |r|^1.1   →  residual 40 costs ~58    (mutters)
+```
+
+Even sharper: the *gradient* is what actually moves `w`, and each point's pull on the gradient scales like `|r|^(q−1)`. At `q = 2` the pull grows **linearly** with the residual — the farther a point is from the line, the harder it yanks. At `q = 1.1` the pull grows like `|r|^0.1`, nearly **flat** — a point 40 away pulls barely harder than a point 2 away. The outlier loses its veto; the majority wins.
+
+### The gradient
+
+Differentiate `L(w)` term by term (chain rule on `|r|^q`, with `r = y − x·w`):
+
+```
+  ∇w L  =  −q · Σ xᵢ · |rᵢ|^(q−1) · sign(rᵢ)
+```
+
+or in matrix form:
+
+```
+  ∇w L  =  −q · Xᵀ ( |r|^(q−1) ⊙ sign(r) )        r = Y − X·w,   ⊙ = element-wise
+```
+
+Sanity check: plug in `q = 2` and you get `−2·Xᵀr = 2·Xᵀ(Xw − Y)` — exactly the OLS gradient from §3. The q-norm is a strict generalization.
+
+### No formula this time — gradient descent is mandatory
+
+For `q = 2` the gradient set to zero gives the closed-form OLS solution (§2). For any other `q` the `|r|^(q−1)` factor makes the equation unsolvable by rearranging symbols — so we walk instead, with the same update rule as always:
+
+```
+  w_new = w_old − step_size · ∇w L
+        = w_old + step_size · q · Xᵀ ( |r|^(q−1) ⊙ sign(r) )
+```
+
+**In the code** (`task2.py`, fourth fit):
+
+```python
+r = Y_outlier - X_h.dot(w_q)
+w_q += step_size*q*X_h.T.dot(np.power(np.abs(r), q-1)*np.sign(r))
+```
+
+Note the step size dropped to `0.001`: the q-norm gradient doesn't grow with residual size the way the OLS gradient does, so its scale is different and the knob needs re-tuning (§6 again).
+
+### Why this is the "right" answer to the outlier problem
+
+The sinusoidal and RBF fits in `task2.py` treat the outlier as **signal** and bend the curve through it — spending 41 weights to fit 10 points (§7b). The q-norm fit does the opposite: it keeps the correct **linear** basis and one weight, and changes only what "close to the data" *means*, so the outlier is quietly outvoted. Result: slope ≈ 5, essentially the clean-data OLS answer, without deleting a single point.
+
+> **The general lesson:** the basis function decides *what shape* you fit (§4); the loss function decides *what "fits well" means*. Outliers are a loss-function problem, not a basis problem.
+
+---
+
 ## One-sentence summary
 
-**Regression finds the weight `w` that minimizes squared error; you can get `w` from an exact formula when the problem is simple, or by gradient descent when it isn't — and the choice of basis function (`x` vs `x²`) is what decides whether a straight-line method can fit curved data.**
+**Regression finds the weight `w` that minimizes a loss; you can get `w` from an exact formula when the problem is simple (squared error, linear basis), or by gradient descent when it isn't — the choice of basis function (`x` vs `x²`) decides whether you can fit curved data, and the choice of loss (2-norm vs q-norm) decides whether one outlier can ruin the fit.**

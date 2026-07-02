@@ -1,10 +1,11 @@
 # THE ANSWER:
 # The outlier ruins the linear fit, and way-to-go data analyst answer would be excluding the outlier
-# and therefor change Y_outlier to Y_h on line 16 and use this fit. However, what if the outlier was
-# an important, non-removable part of data? My best guess was multi-sinusoidal function, that fits pretty well
-# and weights are determained nicely using OLS. LLM suggested Gaussian RBF, which also works, however, I prefer
-# my sinusoidal method more. With such a low amount of data, it is hard to tell whether sinusoidal fits closely to
+# and therefor change Y_outlier to Y_h on line 16 and use this fit, or implementing q-norm(line 83). However, what 
+# if the outlier was an important, non-removable part of data? My best guess was multi-sinusoidal function, that 
+# fits pretty well and weights are determained nicely using OLS. LLM suggested Gaussian RBF, which also works, however, 
+# I prefer my sinusoidal method more. With such a low amount of data, it is hard to tell whether sinusoidal fits closely to
 # the "real" function, since we don't know what's "actually" between 2 points and whether it oscilates properly.
+
      
 import numpy as np
 import matplotlib.pyplot as plt
@@ -76,4 +77,29 @@ plt.scatter(X_h, Y_outlier, color="red")
 plt.scatter(X_h, Y_h, color="blue")
 for xi, yi in zip(X_h[:,0], Y_outlier[:,0]):
     plt.annotate(f"{xi:.2f}", (xi, yi), textcoords="offset points", xytext=(5,5), fontsize=8)
+plt.show()
+
+
+q = 1.1
+w_q = np.random.normal(0,1,size=(1,1))
+step_size = 0.001
+
+i = 0
+while i < max_iter:
+    r = Y_outlier - X_h.dot(w_q)
+    w_q += step_size*q*X_h.T.dot(np.power(np.abs(r), q-1)*np.sign(r))
+    i += 1
+
+w_clean = (1.0/np.dot(X_h.T, X_h))[0,0]*X_h.T.dot(Y_h)[0,0]   #OLS on clean data, for reference
+print(f"OLS slope with outlier:  {w:.3f}")
+print(f"OLS slope on clean data: {w_clean:.3f}")
+print(f"q-norm (q={q}) slope:    {w_q[0,0]:.3f}   (true slope = 5)")
+
+plt.plot(x_line, w*x_line, color="orange", lw=3, label=f"OLS (2-norm) with outlier: w={w:.2f}")
+plt.plot(x_line, x_line.dot(w_q), color="green", lw=3, label=f"q-norm, q={q}: w={w_q[0,0]:.2f}")
+plt.plot(x_line, w_clean*x_line, color="gray", ls="--", lw=2, label=f"OLS on clean data: w={w_clean:.2f}")
+plt.title("Robust linear regression with q-norm loss, weight determined by gradient descent")
+plt.scatter(X_h, Y_outlier, color="red")
+plt.scatter(X_h, Y_h, color="blue")
+plt.legend()
 plt.show()
