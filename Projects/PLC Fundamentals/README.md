@@ -1,121 +1,156 @@
+<!-- Optional: replace this line with a one-line intro about yourself (e.g. name, EE/CS student, focus areas). -->
+
 # PLC Fundamentals in CODESYS — Motor Control & Legacy Conveyor Debugging
 
 **Platform:** CODESYS V3.5 · CODESYS Control Win V3 (soft PLC, simulation mode) · IEC 61131-3 (Ladder Diagram + Structured Text)
 
-This repository documents a structured, hands-on walk through the core building blocks — and the classic failure modes — of industrial PLC programming. It is not a single finished machine but a deliberately incremental series: each step adds exactly one requirement, and several steps intentionally reproduce the bugs that PLC programmers spend real time chasing on site — the *double-coil*, *one-shot / edge detection*, *scan-order oscillation*, *fail-safe wiring*, and *requirements-vs-code* mismatches. Every program was built and verified in the CODESYS simulator against explicit acceptance criteria before moving on.
+This repository demonstrates command of the fundamentals of industrial PLC programming — in both Ladder and Structured Text — through a progression of tasks. Each task is stated as a **brief** (the kind of change request a controls engineer receives), then implemented and validated in the CODESYS simulator against explicit acceptance criteria. Several tasks are chosen specifically to surface the failure modes that cost real time in the field: the *double-coil*, *one-shot / edge detection*, *scan-order oscillation*, *fail-safe wiring*, and *requirements-vs-code* mismatches — and to show these being reasoned about at the scan-cycle level, not just made to run.
 
-The intent is to demonstrate understanding of **why** ladder and Structured Text behave the way they do at the scan-cycle level — not just that a program happens to run.
+The debugging half (Part B) takes a deliberately broken legacy program and works from field symptoms back to the responsible lines and their mechanisms.
 
 ---
 
-## What this demonstrates
+## Concepts demonstrated
 
-- **Ladder logic (LD):** contacts, coils, seal-in latches, parallel (OR) branches, mutual interlocks
+- **Ladder (LD):** contacts, coils, seal-in latches, parallel (OR) branches, mutual interlocks
 - **Structured Text (ST):** latches, `IF` / `ELSIF`, function-block instances, edge triggers, `TON` timers
-- **Fail-safe design:** normally-closed field wiring, and why an NC device correctly appears as an NO contact in the logic (a cut wire must read as "stop")
-- **Edge detection / one-shots** (`R_TRIG`) — and, just as importantly, *choosing what an event should mean* (a button press vs. a contactor operation)
-- **The scan cycle:** double-write bugs, statement/rung order, and why every output must be written in exactly one place
+- **Fail-safe design:** normally-closed field wiring, and why an NC device correctly appears as an NO contact (a cut wire must read as "stop")
+- **Edge detection / one-shots** (`R_TRIG`) — and choosing *what* an event should mean (a button press vs. a contactor operation)
+- **The scan cycle:** double-write bugs, statement/rung order, and why every output is written in exactly one place
 - **State vs. output:** separating a latch (memory) from the command that drives an actuator
 - **Staged starting:** star-delta sequencing with a `TON` and a hard mutual interlock
-- **Debugging methodology:** reproduce → isolate to a rung/line → diagnose the *mechanism* → fix — and writing acceptance tests that actually pin the intended behaviour down (including tests that wait out a timer)
+- **Debugging methodology:** reproduce → isolate to a rung/line → diagnose the *mechanism* → fix — and writing acceptance tests that pin the behaviour down (including tests that wait out a timer)
 
 ---
 
 ## Part A — Motor control, built incrementally
 
+Each brief adds exactly one requirement to the previous program.
+
 ### 1 · Start/Stop with seal-in and fail-safe stop
+
+> **Brief.** Inputs: `bStartPB` (momentary), `bStopPB` (momentary, wired **normally-closed** — TRUE when *not* pressed), `bMotorProtOK` (TRUE = healthy). Output: `bMotorRun`. Start starts the motor; it must stay running after Start is released — a seal-in, **no SET/RESET coils**. Stop, or loss of `bMotorProtOK`, stops it immediately. **Acceptance:** a broken Stop wire (`bStopPB` forced FALSE) must stop the motor, not leave it running.
 
 ![Task 1 – seal-in start/stop](images/task1_seal_in.png)
 
-A momentary **Start** latches the motor through a **seal-in** (hold) contact — the output feeds back to keep its own rung true after the button is released. **Stop**, or loss of the motor-protection signal, drops it immediately.
-
-The subtlety: the Stop button is a **normally-closed** field device, so it is TRUE during normal operation and FALSE only when pressed *or when its wire is cut*. It therefore appears in the logic as a **normally-open** contact — the fail-safe convention, so a broken wire fails to the safe "stopped" state.
+A momentary Start latches the motor through a **seal-in** contact — the output feeds back to keep its own rung true after the button is released. The instructive point is the Stop button: it is a **normally-closed** field device, TRUE in normal operation and FALSE only when pressed *or when its wire is cut*, so it appears in the logic as a **normally-open** contact. A broken wire then fails to the safe "stopped" state — the fail-safe convention, and the reason competent programs show stop buttons as plain contacts.
 
 ### 2 · Maintenance start counter — the one-shot
 
+> **Brief.** Add `nStartCount : INT` and `bServiceDue : BOOL`. Increment the count each time the motor *starts* (a stopped→running transition); light `bServiceDue` once the count reaches the threshold (the lamp does **not** stop the motor); a reset input returns the count to 0. **Constraint:** no counter function block — build it from `ADD`, `GE`, `MOVE`.
+
 ![Task 2 – edge-detected counter](images/task2_counter_edge.png)
 
-Counts how many times the **motor** starts (i.e. contactor operations, which is what physically wears the contactor) and lights a service lamp at a threshold.
-
-The naive version — *increment while Start is pressed* — counts once **per scan**, roughly +20 per press at a 10 ms scan. Fixed with **rising-edge detection** on the run command, so one press = one count. Which signal's edge is used is a genuine design decision: the counter models metal fatigue, so it counts the *contactor coil*, not the button.
+The naive version — *increment while Start is pressed* — counts once **per scan**, roughly +20 per press at a 10 ms scan, because ladder samples state every scan rather than reacting to events. Fixed with **rising-edge detection** on the run command, so one press = one count. Which signal's edge is used is a real design decision: the counter models contactor wear, so it counts the contactor coil, not the button.
 
 ### 3 · Jog, and separating latch from output — the double-coil
 
+> **Brief (verbatim change request).** *"Maintenance wants a jog button. While `bJogPB` is held, the motor runs; released, it stops immediately — no latching. Normal start/stop must keep working exactly as before. Jog must still respect `bMotorProtOK`."*
+
 ![Task 3 – latch/output separation](images/task3_jog_latch.png)
 
-Adds a hold-to-run **jog**. The tempting implementation puts a *second coil* on the motor output — but two rungs writing one output is a **double-coil**, and only the last write of the scan survives. The result is insidious: the seal-in silently fails while jog *appears* to work, so the bug surfaces in a different feature than the one that causes it.
-
-Fixed by computing a latch (`bRunLatch`) in one rung, and driving the **single** motor coil from `(bRunLatch OR bJogPB) AND interlocks` in another. State lives in exactly one place; the output is written exactly once. Jogging deliberately never engages the delta stage.
+The tempting implementation puts a *second coil* on the motor output — but two rungs writing one output is a **double-coil**, and only the last write of the scan survives. The failure is insidious: the seal-in silently stops working while jog *appears* to work, so the bug shows up in a different feature than the one that causes it. Fixed by computing a latch (`bRunLatch`) in one rung and driving the **single** motor coil from `(bRunLatch OR bJogPB) AND interlocks` in another. State lives in exactly one place; the output is written exactly once; jog deliberately never engages a later stage.
 
 ### 4 · Star-delta staged start — timers + interlock
 
+> **Brief.** Replace the single motor output with two contactor outputs, `bStarCon` and `bDeltaCon`. Run command → **star** immediately → after **5 s**, star drops and delta pulls in → delta holds while the run command holds; run command drops → both off, and any restart begins again from star. **Hard safety requirement:** `bStarCon` and `bDeltaCon` must **never** be TRUE in the same scan (simultaneous closure is a phase-to-phase short) — enforce it with mutual interlock contacts, not by trusting the sequence. Jog uses **star only**. The counter now counts **star** pull-ins.
+
 ![Task 4 – star-delta with TON](images/task4_star_delta.png)
 
-Two contactor outputs (`bStarCon`, `bDeltaCon`) sequenced by a `TON`: run command → **star** → after 5 s → **delta**, held until the run command drops.
-
-Hard safety requirement: star and delta must **never** be energised in the same scan — simultaneous closure is a phase-to-phase short. This is enforced in logic with **mutual normally-closed interlock contacts**, not merely by trusting the sequence. A single `TON` instance is used and called once; its `.Q` output is reused as a contact wherever the "elapsed" signal is needed.
+A single `TON` sequences the two contactors. The no-overlap requirement is enforced with **mutual normally-closed interlock contacts** (NC `bDeltaCon` in the star rung, NC `bStarCon` in the delta rung), and confirmed scan-by-scan in the live view — there is no scan in which both are energised. One timer instance, called once; its `.Q` output reused as a contact wherever the "elapsed" signal is needed.
 
 ---
 
-## Part B — Debugging an inherited "legacy" conveyor (Structured Text)
+## Part B — Debugging an inherited conveyor (Structured Text)
 
-A deliberately messy conveyor program — commented *"last edited 2011"*, junk tag names (`MERKER_1`, `HILF_MERKER_2`, `M13_4`), German comments including a *"DO NOT TOUCH!!"* on the broken block — arrives with four field complaints from the night shift. The task was to reproduce each in simulation, isolate it to specific lines, and explain the **mechanism** before touching anything.
+> **The situation.** You've inherited a conveyor program, last touched in 2011 by a contractor who no longer exists. The night shift's complaint, verbatim:
+>
+> *"The piece counter showed 400 after about a dozen boxes. The FULL lamp flickers sometimes instead of staying on. The belt sometimes restarts all by itself a few seconds after we stop loading. And yesterday the count vanished to zero on its own."*
+>
+> **Plant context:** `E_LS1` / `E_LS2` are light barriers (TRUE = beam blocked by a box) at the infeed and outfeed. Intended behaviour, as far as anyone remembers: start/stop-latched belt, a 3 s run-on after the infeed goes clear, piece counting at the outfeed, FULL lamp at 10 pieces, and some form of counter acknowledge.
 
-| Symptom (operator complaint) | Root cause | Fix |
-|---|---|---|
-| Piece count showed **400** after ~12 boxes | Counter incremented *every scan* the outfeed beam was blocked (no edge) | `R_TRIG` on the outfeed sensor — count on the rising edge only |
-| **FULL lamp flickers** instead of latching | Runaway count interacting with the reset-on-start below, slamming the value around the threshold | Dissolved automatically by the edge-count + dedicated-reset fixes — a *symptom* of the two real root causes, not a separate bug |
-| Belt **restarts by itself** seconds after loading stops | **Double write / scan-order oscillation** — run-on cleared the *output* (`A_BAND`), but `A_BAND := latch` at the top of the scan re-asserted it every scan → belt toggled on/off on alternating scans | Run-on clears the *latch*, not just the output |
-| Piece count **resets to 0 on its own** | The counter reset was tied to the Start button | Moved to a dedicated acknowledge button |
-
-The centrepiece is the third one. The "spontaneous restart" is really a **one-scan oscillation**: an output written in two places while it is recomputed from the latch every scan is the exact Structured-Text twin of the double-coil in Part A. The lesson generalises to the rule used throughout the rewrite — *every output gets one statement that sets it true; stops and timeouts may stack as conditional clears.*
-
-### A documented design decision (not a bug)
-
-The rewrite lets a fresh box at the infeed **auto-resume** the belt after a run-on stop — but a manual **Stop overrides any arriving box** (e.g. a lunch break must keep the belt stopped, even with material sitting on the infeed). This is achieved by folding the infeed edge into the *single* latch expression and gating the whole thing with the (NC) Stop:
+### The program as inherited (verbatim)
 
 ```iecst
-R_TRIG_LS1(CLK := E_LS1);
-bRunLatch := (E_START OR R_TRIG_LS1.Q OR bRunLatch) AND E_STOP;
-```
+PROGRAM FOERDER_PRG
+VAR
+    E_START       : BOOL;         (* Taster Start *)
+    E_STOP        : BOOL := TRUE; (* Oeffner! *)
+    E_LS1         : BOOL;         (* Lichtschranke Einlauf *)
+    E_LS2         : BOOL;         (* Lichtschranke Auslauf *)
+    A_BAND        : BOOL;         (* Bandmotor *)
+    A_LAMPE_VOLL  : BOOL;
+    MERKER_1      : BOOL;
+    HILF_MERKER_2 : BOOL;
+    Z_STUECK      : INT;
+    T_NACHLAUF    : TON;
+    M13_4         : BOOL;
+END_VAR
 
-so there is still exactly one statement that sets the latch true, and Stop wins over everything. This distinction — *clearing state* vs. *gating an output* — is the thread running under most of the design choices in this project.
-
----
-
-## Code
-
-Full fixed program: **[`conveyor_control.st`](conveyor_control.st)**
-
-**Before** (the inherited program — reproduced verbatim, bugs intact):
-
-```iecst
+(* Bandsteuerung -- geaendert 03.11.2011 K.H. *)
 MERKER_1 := (E_START OR MERKER_1) AND E_STOP;
+
 A_BAND := MERKER_1;
 
-IF E_LS2 THEN                       (* counts every scan -> runs away *)
+(* Stueckzaehler am Auslauf *)
+IF E_LS2 THEN
     Z_STUECK := Z_STUECK + 1;
 END_IF
 
+(* Voll-Meldung ab 10 Stueck *)
 IF Z_STUECK >= 10 THEN
     A_LAMPE_VOLL := TRUE;
 ELSE
     A_LAMPE_VOLL := FALSE;
 END_IF
 
+(* Nachlauf 3s wenn Einlauf frei -- NICHT ANFASSEN!! *)
 T_NACHLAUF(IN := NOT E_LS1, PT := T#3S);
 M13_4 := T_NACHLAUF.Q;
+
 IF M13_4 THEN
-    A_BAND := FALSE;                (* clears OUTPUT, not latch -> oscillates *)
+    A_BAND := FALSE;
 END_IF
 
+(* Quittierung *)
 HILF_MERKER_2 := E_START AND E_STOP;
-IF HILF_MERKER_2 THEN               (* reset tied to Start -> count vanishes *)
+IF HILF_MERKER_2 THEN
     Z_STUECK := 0;
 END_IF
 ```
 
-**After** (core logic — see the `.st` file for full declarations and comments):
+### How it was processed
+
+Each complaint was reproduced in the simulator, isolated to the responsible line(s), and diagnosed for its **mechanism** before anything was changed:
+
+**1 · Counter runs to 400 from ~12 boxes.**
+`IF E_LS2 THEN Z_STUECK := Z_STUECK + 1; END_IF` runs *every scan* the outfeed beam is blocked. A box dwelling on the sensor for a fraction of a second adds dozens of counts at a 10 ms scan. There is no notion of "one box, one count" because ladder/ST react to *state*, not *events*. → count only on the **rising edge** of `E_LS2` (`R_TRIG`).
+
+**2 · Belt restarts by itself a few seconds after loading stops — the centrepiece.**
+This is not a restart; it is a **one-scan oscillation** caused by a **double write**. `A_BAND := MERKER_1;` at the top of the scan writes the output from the latch *every scan*. The run-on block clears only the *output* — `IF M13_4 THEN A_BAND := FALSE; END_IF` — but `MERKER_1` is still TRUE (nobody pressed Stop). So on scan N the run-on sets `A_BAND := FALSE`; on scan N+1 the top line sets `A_BAND := MERKER_1 = TRUE` again; the timer is still elapsed, so scan N+2 clears it again. The belt is commanded on/off on alternating scans, which the operators perceive as a spontaneous restart. → the run-on must clear the **latch** (`MERKER_1`), not just the output.
+
+**3 · FULL lamp flickers instead of latching.**
+A *symptom* of two other faults rather than an independent bug: the runaway counter (fault 1) interacting with the reset-on-start (fault 4). `IF (E_START AND E_STOP) THEN Z_STUECK := 0` slams the count toward zero while `E_LS2` drives it up, and around the threshold the lamp stutters. Fixing the two root causes (edge-count + a dedicated reset) removes both inputs to the interaction and the flicker dissolves — a good illustration of why diagnosing before fixing matters: several complaints collapse into two causes.
+
+**4 · Count resets to 0 on its own.**
+The acknowledge is `IF (E_START AND E_STOP) THEN Z_STUECK := 0`, i.e. tied to the **Start** button, so every start wipes the count. → move the reset to a **dedicated acknowledge input** (`E_RESET`).
+
+### The rule applied in the rewrite
+
+Every output has **exactly one statement that sets it TRUE**; stops and timeouts may stack as conditional **clears** (FALSE-writes). The "spontaneous restart" is the Structured-Text twin of the double-coil in Part A, and this rule is what prevents both.
+
+### A documented design decision (not a bug)
+
+The rewrite lets a fresh box at the infeed **auto-resume** the belt after a run-on stop — but a manual **Stop overrides any arriving box** (a lunch break must keep the belt stopped even with material on the infeed). This is achieved by folding the infeed edge into the *single* latch expression and gating the whole thing with the (NC) Stop, so there is still exactly one statement that sets the latch true and Stop wins over everything:
+
+```iecst
+R_TRIG_LS1(CLK := E_LS1);
+bRunLatch := (E_START OR R_TRIG_LS1.Q OR bRunLatch) AND E_STOP;
+```
+
+The distinction under this choice — *clearing state* vs. *gating an output* — is the thread running through most of the design decisions in this project.
+
+### Fixed core logic
 
 ```iecst
 (* Belt run latch: Start OR fresh infeed box; Stop (NC) overrides *)
@@ -144,10 +179,12 @@ IF E_RESET THEN
 END_IF
 ```
 
+Full program with declarations and comments: **[`conveyor_control.st`](conveyor_control.st)**
+
 ---
 
-## Notes
+## Scope
 
-Built for learning; the scenarios are intentionally elementary. The point is not the machines but the **failure modes** and the **debugging discipline** behind each fix — the kind of scan-cycle reasoning that separates code that runs in a simulator from code that survives on a real panel.
+These are the fundamentals of ladder and Structured Text, chosen to surface the failure modes that matter in the field — seal-in and fail-safe wiring, one-shots, the double-coil, scan-order oscillation, and requirements-vs-code. Each program was built and validated in the CODESYS simulator against explicit acceptance criteria (including tests that wait out timers). All logic runs on the free CODESYS Control Win V3 soft PLC — no hardware is required to reproduce any of it.
 
-**Environment:** all logic runs on the free CODESYS Control Win V3 soft PLC in simulation mode — no hardware required to reproduce any of it.
+Naming follows the European `E_` / `A_` (Eingang / Ausgang = input / output) convention.
